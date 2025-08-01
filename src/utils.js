@@ -7,7 +7,8 @@ import fs from 'fs/promises';
 import { pipeline } from '@xenova/transformers';
 // Fix for CommonJS module import in ESM
 import faissNode from 'faiss-node';
-const { IndexFlatL2 } = faissNode;
+// Use dynamic access instead of destructuring to avoid const issues
+const IndexFlatL2 = faissNode.IndexFlatL2;
 
 // Get current file path for ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -168,9 +169,9 @@ export const semanticSearch = async (db, query, limit = 10) => {
       try {
         const tags = await db.allAsync(`
           SELECT ZT.ZTITLE as tag_name
-          FROM Z_5TAGS ZNT
-          JOIN ZSFNOTETAG ZT ON ZT.Z_PK = ZNT.Z_13TAGS
-          JOIN ZSFNOTE ZN ON ZN.Z_PK = ZNT.Z_5NOTES
+          FROM Z_5TAGS J
+          JOIN ZSFNOTETAG ZT ON ZT.Z_PK = J.Z_13TAGS
+          JOIN ZSFNOTE ZN ON ZN.Z_PK = J.Z_5NOTES
           WHERE ZN.ZUNIQUEIDENTIFIER = ?
         `, [note.id]);
         note.tags = tags.map(t => t.tag_name);
@@ -232,9 +233,9 @@ export const searchNotes = async (db, query, limit = 10, useSemanticSearch = tru
       try {
         const tags = await db.allAsync(`
           SELECT ZT.ZTITLE as tag_name
-          FROM Z_5TAGS ZNT
-          JOIN ZSFNOTETAG ZT ON ZT.Z_PK = ZNT.Z_13TAGS
-          JOIN ZSFNOTE ZN ON ZN.Z_PK = ZNT.Z_5NOTES
+          FROM Z_5TAGS J
+          JOIN ZSFNOTETAG ZT ON ZT.Z_PK = J.Z_13TAGS
+          JOIN ZSFNOTE ZN ON ZN.Z_PK = J.Z_5NOTES
           WHERE ZN.ZUNIQUEIDENTIFIER = ?
         `, [note.id]);
         
@@ -344,5 +345,86 @@ export const retrieveForRAG = async (db, query, limit = 5) => {
       content: note.content,
       tags: note.tags
     }));
+  }
+};
+
+// Create vector index for all notes
+export const createVectorIndex = async (db) => {
+  try {
+    console.error('Starting to create vector index for Bear Notes...');
+    
+    // Initialize the embedding model if not already done
+    const modelInitialized = await initEmbedder();
+    if (!modelInitialized) {
+      throw new Error('Failed to initialize embedding model');
+    }
+    
+    // Get all non-trashed notes
+    const notes = await db.allAsync(`
+      SELECT 
+        ZUNIQUEIDENTIFIER as id,
+        ZTITLE as title,
+        ZTEXT as content
+      FROM ZSFNOTE
+      WHERE ZTRASHED = 0
+    `);
+    
+    console.error(`Found ${notes.length} notes to index`);
+    
+    // Create vectors for all notes
+    const noteIds = [];
+    const dimension = 384; // Dimension of the all-MiniLM-L6-v2 model
+    
+    // Create FAISS index
+    const index = new IndexFlatL2(dimension);
+    
+    // Process notes in batches to avoid memory issues
+    for (let i = 0; i < notes.length; i++) {
+      const note = notes[i];
+      
+      // Create a combined text for embedding
+      const textToEmbed = `${note.title}\n${note.content || ''}`.trim();
+      
+      if (textToEmbed) {
+        try {
+          // Create embedding for the note
+          const embedding = await createEmbedding(textToEmbed);
+          
+          // Add to index
+          index.add(embedding);
+          
+          // Store note ID
+          noteIds.push(note.id);
+          
+          if ((i + 1) % 50 === 0 || i === notes.length - 1) {
+            console.error(`Indexed ${i + 1} of ${notes.length} notes`);
+          }
+        } catch (error) {
+          console.error(`Error embedding note ${note.id}:`, error.message);
+        }
+      }
+    }
+    
+    console.error(`Successfully created embeddings for ${noteIds.length} notes`);
+    
+    // Create mapping from index positions to note IDs
+    const newNoteIdMap = {};
+    for (let i = 0; i < noteIds.length; i++) {
+      newNoteIdMap[i] = noteIds[i];
+    }
+    
+    // Save the index and mapping
+    index.write(`${INDEX_PATH}.index`);
+    await fs.writeFile(`${INDEX_PATH}.json`, JSON.stringify(newNoteIdMap));
+    
+    // Reset global variables to force reload
+    vectorIndex = null;
+    noteIdMap = null;
+    
+    console.error(`Vector index saved to ${INDEX_PATH}`);
+    return { success: true, notesIndexed: noteIds.length };
+  } catch (error) {
+    console.error('Error creating vector index:', error);
+    throw error;
   }
 };

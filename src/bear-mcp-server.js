@@ -16,7 +16,8 @@ import {
   getAllTags,
   loadVectorIndex,
   initEmbedder,
-  retrieveForRAG
+  retrieveForRAG,
+  createVectorIndex
 } from './utils.js';
 
 // Initialize dependencies
@@ -107,6 +108,28 @@ async function main() {
           type: 'object',
           properties: {},
         },
+      },
+      {
+        name: 'reindex_notes',
+        description: 'Re-index all notes to update the vector search index',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+      {
+        name: 'find_note_by_partial_id',
+        description: 'Find a note by partial ID when you only have part of the UUID',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            partial_id: {
+              type: 'string',
+              description: 'Partial ID or title fragment to search for',
+            },
+          },
+          required: ['partial_id'],
+        },
       }
     ];
     
@@ -144,18 +167,21 @@ async function main() {
       try {
         const notes = await searchNotes(db, query, limit, useSemanticSearch);
         return { 
-          toolResult: { 
-            notes,
-            searchMethod: useSemanticSearch ? 'semantic' : 'keyword' 
-          } 
+          content: [
+            {
+              type: "text",
+              text: `Found ${notes.length} notes using ${useSemanticSearch ? 'semantic' : 'keyword'} search:\n\n${notes.map(note => `**${note.title}**\nID: ${note.id}\n${note.content}\n`).join('\n')}`
+            }
+          ]
         };
       } catch (error) {
         return { 
-          toolResult: { 
-            error: `Search failed: ${error.message}`,
-            searchMethod: 'keyword',
-            notes: [] 
-          } 
+          content: [
+            {
+              type: "text",
+              text: `Search failed: ${error.message}`
+            }
+          ]
         };
       }
     }
@@ -164,18 +190,46 @@ async function main() {
       const { id } = request.params.arguments;
       try {
         const note = await retrieveNote(db, id);
-        return { toolResult: { note } };
+        return { 
+          content: [
+            {
+              type: "text",
+              text: `**${note.title}**\n\n${note.content}\n\n*Tags: ${note.tags.join(', ')}*\n*Created: ${note.creation_date}*`
+            }
+          ]
+        };
       } catch (error) {
-        return { toolResult: { error: error.message } };
+        return { 
+          content: [
+            {
+              type: "text",
+              text: `Error retrieving note: ${error.message}`
+            }
+          ]
+        };
       }
     }
     
     if (request.params.name === 'get_tags') {
       try {
         const tags = await getAllTags(db);
-        return { toolResult: { tags } };
+        return { 
+          content: [
+            {
+              type: "text",
+              text: `Available tags (${tags.length}):\n\n${tags.map(tag => `• ${tag}`).join('\n')}`
+            }
+          ]
+        };
       } catch (error) {
-        return { toolResult: { error: error.message } };
+        return { 
+          content: [
+            {
+              type: "text",
+              text: `Error retrieving tags: ${error.message}`
+            }
+          ]
+        };
       }
     }
     
@@ -184,17 +238,112 @@ async function main() {
       try {
         const context = await retrieveForRAG(db, query, limit);
         return { 
-          toolResult: { 
-            context,
-            query 
-          } 
+          content: [
+            {
+              type: "text",
+              text: `Retrieved ${context.length} relevant notes for: "${query}"\n\n${context.map(note => `**${note.title}**\nID: ${note.id}\n${note.content}\n*Score: ${note.score?.toFixed(3) || 'N/A'}*\n`).join('\n')}`
+            }
+          ]
         };
       } catch (error) {
         return { 
-          toolResult: { 
-            error: `RAG retrieval failed: ${error.message}`,
-            context: [] 
-          } 
+          content: [
+            {
+              type: "text",
+              text: `RAG retrieval failed: ${error.message}`
+            }
+          ]
+        };
+      }
+    }
+    
+    if (request.params.name === 'reindex_notes') {
+      try {
+        const result = await createVectorIndex(db);
+        return { 
+          content: [
+            {
+              type: "text",
+              text: `Successfully re-indexed ${result.notesIndexed} notes. Vector search index has been updated.`
+            }
+          ]
+        };
+      } catch (error) {
+        return { 
+          content: [
+            {
+              type: "text",
+              text: `Re-indexing failed: ${error.message}`
+            }
+          ]
+        };
+      }
+    }
+    
+    if (request.params.name === 'find_note_by_partial_id') {
+      const { partial_id } = request.params.arguments;
+      try {
+        const notes = await db.allAsync(`
+          SELECT 
+            ZUNIQUEIDENTIFIER as id,
+            ZTITLE as title,
+            ZTEXT as content,
+            ZSUBTITLE as subtitle,
+            ZCREATIONDATE as creation_date
+          FROM ZSFNOTE
+          WHERE ZTRASHED = 0 AND (ZUNIQUEIDENTIFIER LIKE ? OR ZTITLE LIKE ?)
+          ORDER BY ZMODIFICATIONDATE DESC
+          LIMIT 10
+        `, [`%${partial_id}%`, `%${partial_id}%`]);
+        
+        if (notes.length === 0) {
+          return { 
+            content: [
+              {
+                type: "text",
+                text: `No notes found matching partial ID or title: "${partial_id}"`
+              }
+            ]
+          };
+        }
+        
+        // Get tags for each note
+        for (const note of notes) {
+          try {
+            const tags = await db.allAsync(`
+              SELECT ZT.ZTITLE as tag_name
+              FROM Z_5TAGS J
+              JOIN ZSFNOTETAG ZT ON ZT.Z_PK = J.Z_13TAGS
+              JOIN ZSFNOTE ZN ON ZN.Z_PK = J.Z_5NOTES
+              WHERE ZN.ZUNIQUEIDENTIFIER = ?
+            `, [note.id]);
+            note.tags = tags.map(t => t.tag_name);
+          } catch (tagError) {
+            note.tags = [];
+          }
+          
+          // Convert Apple's timestamp
+          if (note.creation_date) {
+            note.creation_date = new Date((note.creation_date + 978307200) * 1000).toISOString();
+          }
+        }
+        
+        return { 
+          content: [
+            {
+              type: "text",
+              text: `Found ${notes.length} notes matching "${partial_id}":\n\n${notes.map(note => `**${note.title}**\nFull ID: ${note.id}\n${note.content.substring(0, 200)}...\n*Tags: ${note.tags.join(', ')}*\n`).join('\n')}`
+            }
+          ]
+        };
+      } catch (error) {
+        return { 
+          content: [
+            {
+              type: "text",
+              text: `Search failed: ${error.message}`
+            }
+          ]
         };
       }
     }
